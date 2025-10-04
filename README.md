@@ -1,4 +1,4 @@
-# 📘 Adaptive Quiz & Summarizer Agent (Backend)
+# 📘 SmartLearn: An Adaptive Quiz & Summarizer Agent (Backend)
 
 This is the **backend service** for the Adaptive Quiz & Summarizer Agent.
 It uses **FastAPI** with Gemini API integration to provide document summarization, quiz generation, and keypoint extraction.
