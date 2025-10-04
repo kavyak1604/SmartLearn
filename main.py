@@ -1,0 +1,229 @@
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+import logging
+import fitz  # PDF
+import docx  # DOCX
+from pptx import Presentation  # PPTX
+
+from services import summarize_text, generate_quiz, extract_keypoints
+
+# ------------------ Config ------------------
+SECRET_KEY = "secretfortest"   # ⚠️ Change in production
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+fake_users_db = {}
+
+# ------------------ Logging ------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ------------------ FastAPI App ------------------
+app = FastAPI(title="Adaptive Quiz & Summarizer Agent (Gemini)")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# ------------------ Models ------------------
+class User(BaseModel):
+    username: str
+    full_name: Optional[str] = None
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class SummaryRequest(BaseModel):
+    text: str
+    mode: Optional[str] = "short"  # short or detailed
+
+class TextRequest(BaseModel):
+    text: str
+
+# ------------------ Utils ------------------
+def fake_hash_password(password: str):
+    return "hashed-" + password
+
+def verify_password(plain_password, hashed_password):
+    return hashed_password == fake_hash_password(plain_password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None or username not in fake_users_db:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        return fake_users_db[username]
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# ------------------ Auth Routes ------------------
+@app.post("/register")
+def register(user: User):
+    if user.username in fake_users_db:
+        raise HTTPException(status_code=400, detail="Username already exists")
+    fake_users_db[user.username] = {
+        "username": user.username,
+        "full_name": user.full_name,
+        "hashed_password": fake_hash_password(user.password),
+    }
+    return {"message": "User registered successfully"}
+
+@app.post("/token", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = fake_users_db.get(form_data.username)
+    if not user or not verify_password(form_data.password, user["hashed_password"]):
+        raise HTTPException(status_code=400, detail="Invalid username or password")
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = create_access_token(data={"sub": user["username"]}, expires_delta=access_token_expires)
+    return {"access_token": token, "token_type": "bearer"}
+
+# ------------------ Core Routes ------------------
+@app.get("/")
+def home():
+    return {"message": "Server is running 🚀"}
+
+@app.post("/summarize")
+async def summarize(req: SummaryRequest, user: dict = Depends(get_current_user)):
+    summary = await summarize_text(req.text, req.mode)
+    return {"summary": summary}
+
+class QuizRequest(BaseModel):
+    text: str
+    difficulty: Optional[str] = "medium"  # easy | medium | hard
+
+@app.post("/quiz")
+async def quiz(req: QuizRequest, user: dict = Depends(get_current_user)):
+    quiz = await generate_quiz(req.text, req.difficulty)
+    return {"quiz": quiz}
+
+
+
+@app.post("/keypoints")
+async def keypoints(req: TextRequest, user: dict = Depends(get_current_user)):
+    points = await extract_keypoints(req.text)
+    return {"keypoints": points}
+
+# ------------------ File Summarization ------------------
+@app.post("/summarize-pdf")
+async def summarize_pdf(file: UploadFile = File(...), mode: str = "short", user: dict = Depends(get_current_user)):
+    pdf_bytes = await file.read()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = "".join([page.get_text("text") for page in doc])
+    summary = await summarize_text(text, mode)
+    return {"summary": summary}
+
+@app.post("/summarize-docx")
+async def summarize_docx(file: UploadFile = File(...), mode: str = "short", user: dict = Depends(get_current_user)):
+    contents = await file.read()
+    with open("temp.docx", "wb") as f:
+        f.write(contents)
+    doc = docx.Document("temp.docx")
+    text = "\n".join([para.text for para in doc.paragraphs])
+    summary = await summarize_text(text, mode)
+    return {"summary": summary}
+
+@app.post("/summarize-txt")
+async def summarize_txt(file: UploadFile = File(...), mode: str = "short", user: dict = Depends(get_current_user)):
+    contents = await file.read()
+    text = contents.decode("utf-8")
+    summary = await summarize_text(text, mode)
+    return {"summary": summary}
+
+@app.post("/summarize-pptx")
+async def summarize_pptx(file: UploadFile = File(...), mode: str = "short", user: dict = Depends(get_current_user)):
+    contents = await file.read()
+    with open("temp.pptx", "wb") as f:
+        f.write(contents)
+    prs = Presentation("temp.pptx")
+    text = "\n".join([shape.text for slide in prs.slides for shape in slide.shapes if hasattr(shape, "text")])
+    summary = await summarize_text(text, mode)
+    return {"summary": summary}
+
+# ------------------ Document Processing ------------------
+@app.post("/process-pdf")
+async def process_pdf(
+    file: UploadFile = File(...), 
+    mode: str = "short", 
+    difficulty: str = "medium", 
+    user: dict = Depends(get_current_user)
+):
+    pdf_bytes = await file.read()
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = "".join([page.get_text("text") for page in doc])
+    return {
+        "summary": await summarize_text(text, mode),
+        "quiz": await generate_quiz(text, difficulty),
+        "keypoints": await extract_keypoints(text),
+    }
+
+@app.post("/process-docx")
+async def process_docx(
+    file: UploadFile = File(...), 
+    mode: str = "short", 
+    difficulty: str = "medium", 
+    user: dict = Depends(get_current_user)
+):
+    contents = await file.read()
+    with open("temp.docx", "wb") as f:
+        f.write(contents)
+    doc = docx.Document("temp.docx")
+    text = "\n".join([para.text for para in doc.paragraphs])
+    return {
+        "summary": await summarize_text(text, mode),
+        "quiz": await generate_quiz(text, difficulty),
+        "keypoints": await extract_keypoints(text),
+    }
+
+@app.post("/process-txt")
+async def process_txt(
+    file: UploadFile = File(...), 
+    mode: str = "short", 
+    difficulty: str = "medium", 
+    user: dict = Depends(get_current_user)
+):
+    contents = await file.read()
+    text = contents.decode("utf-8")
+    return {
+        "summary": await summarize_text(text, mode),
+        "quiz": await generate_quiz(text, difficulty),
+        "keypoints": await extract_keypoints(text),
+    }
+
+@app.post("/process-pptx")
+async def process_pptx(
+    file: UploadFile = File(...), 
+    mode: str = "short", 
+    difficulty: str = "medium", 
+    user: dict = Depends(get_current_user)
+):
+    contents = await file.read()
+    with open("temp.pptx", "wb") as f:
+        f.write(contents)
+    prs = Presentation("temp.pptx")
+    text = "\n".join([shape.text for slide in prs.slides for shape in slide.shapes if hasattr(shape, "text")])
+    return {
+        "summary": await summarize_text(text, mode),
+        "quiz": await generate_quiz(text, difficulty),
+        "keypoints": await extract_keypoints(text),
+    }
+
+
+
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
