@@ -9,7 +9,7 @@ import fitz  # PDF
 import docx  # DOCX
 from pptx import Presentation  # PPTX
 
-from services import summarize_text, generate_quiz, extract_keypoints
+from services import summarize_text, summarize_with_t5, generate_quiz, extract_keywords, generate_flashcards
 
 # ------------------ Config ------------------
 SECRET_KEY = "secretfortest"   # ⚠️ Change in production
@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ------------------ FastAPI App ------------------
-app = FastAPI(title="Adaptive Quiz & Summarizer Agent (Gemini)")
+app = FastAPI(title="Adaptive Quiz & Summarizer Agent (Gemini + T5)")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # ------------------ Models ------------------
@@ -37,10 +37,14 @@ class Token(BaseModel):
 
 class SummaryRequest(BaseModel):
     text: str
-    mode: Optional[str] = "short"  # short or detailed
+    mode: Optional[str] = "short"  # short | detailed
 
 class TextRequest(BaseModel):
     text: str
+
+class QuizRequest(BaseModel):
+    text: str
+    difficulty: Optional[str] = "medium"  # easy | medium | hard
 
 # ------------------ Utils ------------------
 def fake_hash_password(password: str):
@@ -93,137 +97,163 @@ def home():
 
 @app.post("/summarize")
 async def summarize(req: SummaryRequest, user: dict = Depends(get_current_user)):
-    summary = await summarize_text(req.text, req.mode)
-    return {"summary": summary}
+    """Summarize using Gemini or fallback T5 with model info."""
+    try:
+        result = await summarize_text(req.text, req.mode)
+        if isinstance(result, dict):
+            summary = result.get("summary", "")
+            model_used = result.get("model_used", "Unknown")
+        else:
+            summary = result
+            model_used = "Gemini"
+        return {"summary": summary, "model_used": model_used}
+    except Exception as e:
+        logger.error(f"Summarization failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal summarization error")
 
-class QuizRequest(BaseModel):
-    text: str
-    difficulty: Optional[str] = "medium"  # easy | medium | hard
+@app.post("/summarize-offline")
+async def summarize_offline(request: dict, user: dict = Depends(get_current_user)):
+    text = request.get("text", "")
+    mode = request.get("mode", "short")
+    summary = await summarize_with_t5(text, mode)
+    return {"summary": summary, "model_used": "T5"}
 
 @app.post("/quiz")
 async def quiz(req: QuizRequest, user: dict = Depends(get_current_user)):
     quiz = await generate_quiz(req.text, req.difficulty)
     return {"quiz": quiz}
 
-
-
-@app.post("/keypoints")
-async def keypoints(req: TextRequest, user: dict = Depends(get_current_user)):
-    points = await extract_keypoints(req.text)
-    return {"keypoints": points}
+@app.post("/keywords")
+async def keywords(req: TextRequest, user: dict = Depends(get_current_user)):
+    keywords = await extract_keywords(req.text)
+    return {"keywords": keywords}
 
 # ------------------ File Summarization ------------------
+async def summarize_file_text(text: str, mode: str):
+    result = await summarize_text(text, mode)
+    if isinstance(result, dict):
+        return result.get("summary", ""), result.get("model_used", "Unknown")
+    return result, "Gemini"
+
 @app.post("/summarize-pdf")
 async def summarize_pdf(file: UploadFile = File(...), mode: str = "short", user: dict = Depends(get_current_user)):
-    pdf_bytes = await file.read()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    text = "".join([page.get_text("text") for page in doc])
-    summary = await summarize_text(text, mode)
-    return {"summary": summary}
+    try:
+        pdf_bytes = await file.read()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text = "".join([page.get_text("text") for page in doc])
+        summary, model_used = await summarize_file_text(text, mode)
+        return {"summary": summary, "model_used": model_used}
+    except Exception as e:
+        logger.error(f"PDF summarization failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to summarize PDF")
 
 @app.post("/summarize-docx")
 async def summarize_docx(file: UploadFile = File(...), mode: str = "short", user: dict = Depends(get_current_user)):
-    contents = await file.read()
-    with open("temp.docx", "wb") as f:
-        f.write(contents)
-    doc = docx.Document("temp.docx")
-    text = "\n".join([para.text for para in doc.paragraphs])
-    summary = await summarize_text(text, mode)
-    return {"summary": summary}
+    try:
+        contents = await file.read()
+        with open("temp.docx", "wb") as f:
+            f.write(contents)
+        doc = docx.Document("temp.docx")
+        text = "\n".join([para.text for para in doc.paragraphs])
+        summary, model_used = await summarize_file_text(text, mode)
+        return {"summary": summary, "model_used": model_used}
+    except Exception as e:
+        logger.error(f"DOCX summarization failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to summarize DOCX")
 
 @app.post("/summarize-txt")
 async def summarize_txt(file: UploadFile = File(...), mode: str = "short", user: dict = Depends(get_current_user)):
-    contents = await file.read()
-    text = contents.decode("utf-8")
-    summary = await summarize_text(text, mode)
-    return {"summary": summary}
+    try:
+        contents = await file.read()
+        text = contents.decode("utf-8")
+        summary, model_used = await summarize_file_text(text, mode)
+        return {"summary": summary, "model_used": model_used}
+    except Exception as e:
+        logger.error(f"TXT summarization failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to summarize TXT")
 
 @app.post("/summarize-pptx")
 async def summarize_pptx(file: UploadFile = File(...), mode: str = "short", user: dict = Depends(get_current_user)):
-    contents = await file.read()
-    with open("temp.pptx", "wb") as f:
-        f.write(contents)
-    prs = Presentation("temp.pptx")
-    text = "\n".join([shape.text for slide in prs.slides for shape in slide.shapes if hasattr(shape, "text")])
-    summary = await summarize_text(text, mode)
-    return {"summary": summary}
+    try:
+        contents = await file.read()
+        with open("temp.pptx", "wb") as f:
+            f.write(contents)
+        prs = Presentation("temp.pptx")
+        text = "\n".join([shape.text for slide in prs.slides for shape in slide.shapes if hasattr(shape, "text")])
+        summary, model_used = await summarize_file_text(text, mode)
+        return {"summary": summary, "model_used": model_used}
+    except Exception as e:
+        logger.error(f"PPTX summarization failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to summarize PPTX")
 
 # ------------------ Document Processing ------------------
 @app.post("/process-pdf")
-async def process_pdf(
-    file: UploadFile = File(...), 
-    mode: str = "short", 
-    difficulty: str = "medium", 
-    user: dict = Depends(get_current_user)
-):
+async def process_pdf(file: UploadFile = File(...), mode: str = "short", user: dict = Depends(get_current_user)):
     pdf_bytes = await file.read()
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     text = "".join([page.get_text("text") for page in doc])
+    summary, model_used = await summarize_file_text(text, mode)
     return {
-        "summary": await summarize_text(text, mode),
-        "quiz": await generate_quiz(text, difficulty),
-        "keypoints": await extract_keypoints(text),
+        "summary": summary,
+        "model_used": model_used,
+        "quiz": await generate_quiz(text),
+        "keywords": await extract_keywords(text),
+        "flashcards": await generate_flashcards(text),
     }
 
 @app.post("/process-docx")
-async def process_docx(
-    file: UploadFile = File(...), 
-    mode: str = "short", 
-    difficulty: str = "medium", 
-    user: dict = Depends(get_current_user)
-):
+async def process_docx(file: UploadFile = File(...), mode: str = "short", user: dict = Depends(get_current_user)):
     contents = await file.read()
     with open("temp.docx", "wb") as f:
         f.write(contents)
     doc = docx.Document("temp.docx")
     text = "\n".join([para.text for para in doc.paragraphs])
+    summary, model_used = await summarize_file_text(text, mode)
     return {
-        "summary": await summarize_text(text, mode),
-        "quiz": await generate_quiz(text, difficulty),
-        "keypoints": await extract_keypoints(text),
+        "summary": summary,
+        "model_used": model_used,
+        "quiz": await generate_quiz(text),
+        "keywords": await extract_keywords(text),
+        "flashcards": await generate_flashcards(text),
     }
 
 @app.post("/process-txt")
-async def process_txt(
-    file: UploadFile = File(...), 
-    mode: str = "short", 
-    difficulty: str = "medium", 
-    user: dict = Depends(get_current_user)
-):
+async def process_txt(file: UploadFile = File(...), mode: str = "short", user: dict = Depends(get_current_user)):
     contents = await file.read()
     text = contents.decode("utf-8")
+    summary, model_used = await summarize_file_text(text, mode)
     return {
-        "summary": await summarize_text(text, mode),
-        "quiz": await generate_quiz(text, difficulty),
-        "keypoints": await extract_keypoints(text),
+        "summary": summary,
+        "model_used": model_used,
+        "quiz": await generate_quiz(text),
+        "keywords": await extract_keywords(text),
+        "flashcards": await generate_flashcards(text),
     }
 
 @app.post("/process-pptx")
-async def process_pptx(
-    file: UploadFile = File(...), 
-    mode: str = "short", 
-    difficulty: str = "medium", 
-    user: dict = Depends(get_current_user)
-):
+async def process_pptx(file: UploadFile = File(...), mode: str = "short", user: dict = Depends(get_current_user)):
     contents = await file.read()
     with open("temp.pptx", "wb") as f:
         f.write(contents)
     prs = Presentation("temp.pptx")
     text = "\n".join([shape.text for slide in prs.slides for shape in slide.shapes if hasattr(shape, "text")])
+    summary, model_used = await summarize_file_text(text, mode)
     return {
-        "summary": await summarize_text(text, mode),
-        "quiz": await generate_quiz(text, difficulty),
-        "keypoints": await extract_keypoints(text),
+        "summary": summary,
+        "model_used": model_used,
+        "quiz": await generate_quiz(text),
+        "keywords": await extract_keywords(text),
+        "flashcards": await generate_flashcards(text),
     }
 
-
-
+# ------------------ CORS ------------------
 from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
