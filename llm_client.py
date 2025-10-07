@@ -42,3 +42,12 @@ async def call_llm(prompt: str, model: str = DEFAULT_MODEL):
     except Exception as e:
         logger.exception("Unexpected error in call_llm")
         return "Error: Something went wrong while calling LLM"
+
+
+   # ------------------ Call Gemini Summary ------------------
+async def call_gemini_summary(text: str, mode: str = "short"):
+    """Gemini-based summarization helper"""
+    prompt = f"Summarize the following text in a {mode} format:\n\n{text}"
+    return await call_llm(prompt)
+
+
