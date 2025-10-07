@@ -49,16 +49,32 @@ c) ...
 d) ...
 Answer: x
 """
-KEYPOINTS_PROMPT = """
-Extract the 3-5 most important key points from the following text.
-Keep each point short, factual, and easy to understand.
+# ------------------ Keywords ------------------
+KEYWORDS_PROMPT = """
+Extract the 5 to 10 most important keywords or terms from the following text. 
+Return only the keywords as a list, no explanations.
 
 Text:
 {text}
 
-Key Points:
+Keywords:
 - 
 - 
 - 
 """
+
+# ------------------ Flashcards ------------------
+FLASHCARDS_PROMPT = """
+Generate 5 flashcards from the following text.
+Each flashcard should be in the format:
+
+Keyword: <one or two words>
+Definition: <1-2 sentence simple explanation>
+
+Text:
+{text}
+
+Flashcards:
+"""
+
 
